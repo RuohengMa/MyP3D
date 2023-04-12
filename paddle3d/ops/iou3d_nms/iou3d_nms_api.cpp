@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+*/
 #include <paddle/extension.h>
 
 #include <vector>

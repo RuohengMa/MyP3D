@@ -15,13 +15,17 @@
 #ifndef IOU3D_CPU_H
 #define IOU3D_CPU_H
 
+/*
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+*/
 #include <paddle/extension.h>
 
 #include <vector>
 
 std::vector<paddle::Tensor> boxes_iou_bev_cpu(
-    const paddle::Tensor& boxes_a_tensor, const paddle::Tensor& boxes_b_tensor);
+    const paddle::Tensor& boxes_a_tensor, const paddle::Tensor& boxes_b_tensor) {
+        return std::vector<paddle::Tensor>(paddle::Tensor());
+    }
 
 #endif
