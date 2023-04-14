@@ -25,7 +25,7 @@
 
 std::vector<paddle::Tensor> boxes_iou_bev_cpu(
     const paddle::Tensor& boxes_a_tensor, const paddle::Tensor& boxes_b_tensor) {
-        return std::vector<paddle::Tensor>(paddle::Tensor());
+        return std::vector<paddle::Tensor>{paddle::Tensor()};
     }
 
 #endif
