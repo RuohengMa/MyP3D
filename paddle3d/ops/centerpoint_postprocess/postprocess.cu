@@ -23,11 +23,8 @@
 
 const int THREADS_PER_BLOCK_NMS = sizeof(int64_t) * 8;
 
-void NmsLauncher(const cudaStream_t &stream, const float *bboxes,
-                 const int *index, const int64_t *sorted_index,
-                 const int num_bboxes, const int num_bboxes_for_nms,
-                 const float nms_overlap_thresh, const int decode_bboxes_dims,
-                 int64_t *mask);
+void NmsLauncher(const cudaStream_t &stream, const float *boxes, int64_t *mask,
+                 int boxes_num, float nms_overlap_thresh);
 
 __global__ void decode_kernel(
     const float *score, const float *reg, const float *height, const float *dim,
@@ -38,7 +35,7 @@ __global__ void decode_kernel(
     const float post_center_range_y_min, const float post_center_range_z_min,
     const float post_center_range_x_max, const float post_center_range_y_max,
     const float post_center_range_z_max, const int num_bboxes,
-    const bool with_velocity, const int decode_bboxes_dims, float *bboxes,
+    const bool with_velocity, const int decode_bboxes_dims, float *bboxes, float *nms_bboxes,
     bool *mask, int *score_idx) {
   int box_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (box_idx == num_bboxes || box_idx > num_bboxes) {
@@ -59,6 +56,19 @@ __global__ void decode_kernel(
   bboxes[box_idx * decode_bboxes_dims + 3] = dim[box_idx];
   bboxes[box_idx * decode_bboxes_dims + 4] = dim[box_idx + num_bboxes];
   bboxes[box_idx * decode_bboxes_dims + 5] = dim[box_idx + 2 * num_bboxes];
+
+  // custom
+  nms_bboxes[box_idx * 7] =
+      (x + xs) * down_ratio * voxel_size_x + point_cloud_range_x_min;
+  nms_bboxes[box_idx * 7 + 1] =
+      (y + ys) * down_ratio * voxel_size_y + point_cloud_range_y_min;
+  nms_bboxes[box_idx * 7 + 2] = z;
+  nms_bboxes[box_idx * 7 + 3] = dim[box_idx];
+  nms_bboxes[box_idx * 7 + 4] = dim[box_idx + num_bboxes];
+  nms_bboxes[box_idx * 7 + 5] = dim[box_idx + 2 * num_bboxes];
+  nms_bboxes[box_idx * 7 + 6] =
+        -atan2f(rot[box_idx], rot[box_idx + num_bboxes]) - 3.141592653589793 / 2;
+
   if (with_velocity) {
     bboxes[box_idx * decode_bboxes_dims + 6] = vel[box_idx];
     bboxes[box_idx * decode_bboxes_dims + 7] = vel[box_idx + num_bboxes];
@@ -89,7 +99,7 @@ void DecodeLauncher(
     const float post_center_range_z_min, const float post_center_range_x_max,
     const float post_center_range_y_max, const float post_center_range_z_max,
     const int num_bboxes, const bool with_velocity,
-    const int decode_bboxes_dims, float *bboxes, bool *mask, int *score_idx) {
+    const int decode_bboxes_dims, float *bboxes, float *nms_bboxes, bool *mask, int *score_idx) {
   dim3 blocks(DIVUP(num_bboxes, THREADS_PER_BLOCK_NMS));
   dim3 threads(THREADS_PER_BLOCK_NMS);
   decode_kernel<<<blocks, threads, 0, stream>>>(
@@ -98,7 +108,7 @@ void DecodeLauncher(
       point_cloud_range_y_min, post_center_range_x_min, post_center_range_y_min,
       post_center_range_z_min, post_center_range_x_max, post_center_range_y_max,
       post_center_range_z_max, num_bboxes, with_velocity, decode_bboxes_dims,
-      bboxes, mask, score_idx);
+      bboxes, nms_bboxes, mask, score_idx);
 }
 
 std::vector<paddle::Tensor> postprocess_gpu(
@@ -169,6 +179,9 @@ std::vector<paddle::Tensor> postprocess_gpu(
                                    paddle::GPUPlace());
     int *score_idx_ptr = score_idx.data<int32_t>();
 
+    // custom
+    auto nms_bboxes = paddle::empty({num_bboxes, 7}, paddle::DataType::FLOAT32, paddle::GPUPlace());
+    float *nms_bboxes_ptr = nms_bboxes.data<float>();
     DecodeLauncher(score_per_task.stream(), score_ptr, reg_ptr, height_ptr,
                    exp_dim_per_task_ptr, vel_ptr, rot_ptr, score_threshold,
                    feat_w, down_ratio, voxel_size_x, voxel_size_y,
@@ -176,7 +189,7 @@ std::vector<paddle::Tensor> postprocess_gpu(
                    post_center_range_x_min, post_center_range_y_min,
                    post_center_range_z_min, post_center_range_x_max,
                    post_center_range_y_max, post_center_range_z_max, num_bboxes,
-                   with_velocity, decode_bboxes_dims, decode_bboxes_ptr,
+                   with_velocity, decode_bboxes_dims, decode_bboxes_ptr, nms_bboxes_ptr,
                    thresh_mask_ptr, score_idx_ptr);
 
     // select score by mask
@@ -207,6 +220,10 @@ std::vector<paddle::Tensor> postprocess_gpu(
     int num_bboxes_for_nms =
         num_selected > nms_pre_max_size ? nms_pre_max_size : num_selected;
 
+    // custom
+    auto selected_nms_bboxes = paddle::experimental::gather(nms_bboxes, selected_score_idx, 0);
+    auto sorted_nms_bboxes = paddle::experimental::gather(selected_nms_bboxes, sorted_index, 0);
+
     // nms
     // in NmsLauncher, rot = - theta - pi / 2
     const int col_blocks = DIVUP(num_bboxes_for_nms, THREADS_PER_BLOCK_NMS);
@@ -214,10 +231,15 @@ std::vector<paddle::Tensor> postprocess_gpu(
                                   paddle::DataType::INT64, paddle::GPUPlace());
     int64_t *nms_mask_data = nms_mask.data<int64_t>();
 
+    // custom
+    NmsLauncher(score_per_task.stream(), sorted_nms_bboxes.data<float>(),
+                nms_mask_data, num_bboxes_for_nms, nms_iou_threshold);
+    /*
     NmsLauncher(score_per_task.stream(), decode_bboxes.data<float>(),
                 selected_score_idx.data<int>(), sorted_index.data<int64_t>(),
                 num_selected, num_bboxes_for_nms, nms_iou_threshold,
                 decode_bboxes_dims, nms_mask_data);
+    */
 
     const paddle::Tensor nms_mask_cpu_tensor =
         nms_mask.copy_to(paddle::CPUPlace(), true);
